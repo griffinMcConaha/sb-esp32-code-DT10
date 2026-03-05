@@ -13,6 +13,14 @@
 #define FLOW_PIN GPIO_NUM_33
 #define RPM_PIN GPIO_NUM_32
 
+// External system control outputs (available GPIOs; change as needed)
+// System 1: Brine agitator (turn on first)
+#define BRINE_AGITATOR_ENABLE_PIN GPIO_NUM_18
+#define BRINE_AGITATOR_SWITCH_PIN GPIO_NUM_19
+// System 2: Patent gear (turn on when robot is moving)
+#define PATENT_GEAR_ENABLE_PIN GPIO_NUM_21
+#define PATENT_GEAR_SWITCH_PIN GPIO_NUM_22
+
 // UART link to STM32 (command + feedback channel)
 #define STM32_UART_NUM UART_NUM_1
 #define STM32_UART_TX_PIN GPIO_NUM_17
@@ -53,6 +61,9 @@
 #define RPM_TASK_PERIOD_MS 1000
 #define MAIN_LOOP_PERIOD_MS 500
 #define STM32_RX_TIMEOUT_MS 20
+
+// Movement detection threshold (RPM) for patent gear activation
+#define ROBOT_MOVING_RPM_THRESHOLD 1.0f
 
 // UART line/message buffer sizes
 #define STM32_RX_LINE_BUFFER_LEN 128

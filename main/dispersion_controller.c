@@ -33,6 +33,44 @@ typedef struct {
 
 static volatile FeedbackData_t feedback = {0.0f, 0.0f, 0};
 static portMUX_TYPE feedback_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool patent_gear_active = false;
+
+static void configure_external_system_outputs(void)
+{
+	gpio_config_t output_cfg = {
+		.pin_bit_mask = (1ULL << BRINE_AGITATOR_ENABLE_PIN) |
+				(1ULL << BRINE_AGITATOR_SWITCH_PIN) |
+				(1ULL << PATENT_GEAR_ENABLE_PIN) |
+				(1ULL << PATENT_GEAR_SWITCH_PIN),
+		.mode = GPIO_MODE_OUTPUT,
+		.pull_up_en = GPIO_PULLUP_DISABLE,
+		.pull_down_en = GPIO_PULLDOWN_DISABLE,
+		.intr_type = GPIO_INTR_DISABLE,
+	};
+	gpio_config(&output_cfg);
+}
+
+static void set_brine_agitator_active(bool active)
+{
+	gpio_set_level(BRINE_AGITATOR_ENABLE_PIN, active ? 1 : 0);
+	gpio_set_level(BRINE_AGITATOR_SWITCH_PIN, active ? 1 : 0);
+}
+
+static void set_patent_gear_active(bool active)
+{
+	gpio_set_level(PATENT_GEAR_ENABLE_PIN, active ? 1 : 0);
+	gpio_set_level(PATENT_GEAR_SWITCH_PIN, active ? 1 : 0);
+}
+
+static void update_external_system_sequence(float current_rpm)
+{
+	bool moving = current_rpm >= ROBOT_MOVING_RPM_THRESHOLD;
+	if (moving != patent_gear_active) {
+		patent_gear_active = moving;
+		set_patent_gear_active(patent_gear_active);
+		printf("[CTRL] Patent gear %s (RPM=%.1f)\n", patent_gear_active ? "ON" : "OFF", current_rpm);
+	}
+}
 
 // Clamp helper used by output calibration functions.
 static float clamp_voltage(float voltage)
@@ -116,9 +154,11 @@ static void send_stm32_line(const char *line)
 	(void)uart_write_bytes(STM32_UART_NUM, line, strlen(line));
 }
 
-// Accepts commands:
+// Accepts commands:[]
 // 1) PCT:<percent>
 // 2) SALT:<percent>,BRINE:<percent>
+// 3) TEST SALT <percent>
+// 4) TEST BRINE <percent>
 static void process_stm32_command(const char *line)
 {
 	if (!line || line[0] == '\0') {
@@ -137,6 +177,18 @@ static void process_stm32_command(const char *line)
 
 	if (sscanf(line, "SALT:%f,BRINE:%f", &salt, &brine) == 2) {
 		apply_percentages(salt, brine);
+		send_stm32_line("STATUS:OK\r\n");
+		return;
+	}
+
+	if (sscanf(line, "TEST SALT %f", &salt) == 1) {
+		apply_percentages(salt, 0.0f);
+		send_stm32_line("STATUS:OK\r\n");
+		return;
+	}
+
+	if (sscanf(line, "TEST BRINE %f", &brine) == 1) {
+		apply_percentages(0.0f, brine);
 		send_stm32_line("STATUS:OK\r\n");
 		return;
 	}
@@ -294,6 +346,8 @@ static void main_loop_task(void *arg)
 		fb_flow_hz = feedback.flow_hz;
 		portEXIT_CRITICAL(&feedback_mux);
 
+		update_external_system_sequence(fb_rpm);
+
 		float flow_lpm = (fb_flow_hz > 0.0f) ? (fb_flow_hz / FLOW_HZ_TO_LPM_DIVISOR) : 0.0f;
 		float flow_mlmin = flow_lpm * LPM_TO_MLMIN_FACTOR;
 		uint16_t brine_mlmin = (flow_mlmin > 0.0f) ? (uint16_t)flow_mlmin : 0;
@@ -359,6 +413,11 @@ void dispersion_controller_start(void)
 	gpio_install_isr_service(0);
 	gpio_isr_handler_add(RPM_PIN, on_rpm_pulse, NULL);
 	gpio_isr_handler_add(FLOW_PIN, on_flow_pulse, NULL);
+
+	configure_external_system_outputs();
+	set_brine_agitator_active(true);
+	set_patent_gear_active(false);
+	printf("[CTRL] Brine agitator ON, patent gear waiting for movement\n");
 
 	apply_percentage(0.0f);
 	send_stm32_line("STATUS:OK\r\n");
