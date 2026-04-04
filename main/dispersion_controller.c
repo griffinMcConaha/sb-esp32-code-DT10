@@ -33,15 +33,22 @@ typedef struct {
 
 static volatile FeedbackData_t feedback = {0.0f, 0.0f, 0};
 static portMUX_TYPE feedback_mux = portMUX_INITIALIZER_UNLOCKED;
-static bool patent_gear_active = false;
+static bool salt_thrower_active = false;
+static volatile float current_salt_percent = 0.0f;
+static volatile float current_brine_percent = 0.0f;
+static volatile bool startup_check_completed = false;
+static volatile bool startup_check_running = false;
+static volatile TickType_t startup_check_started_tick = 0;
+static volatile TickType_t startup_gate_opened_tick = 0;
+
+static void send_stm32_line(const char *line);
 
 static void configure_external_system_outputs(void)
 {
 	gpio_config_t output_cfg = {
 		.pin_bit_mask = (1ULL << BRINE_AGITATOR_ENABLE_PIN) |
-				(1ULL << BRINE_AGITATOR_SWITCH_PIN) |
-				(1ULL << PATENT_GEAR_ENABLE_PIN) |
-				(1ULL << PATENT_GEAR_SWITCH_PIN),
+				(1ULL << SALT_THROWER_ENABLE_PIN) |
+				(1ULL << SABERTOOTH_RELAY_PIN),
 		.mode = GPIO_MODE_OUTPUT,
 		.pull_up_en = GPIO_PULLUP_DISABLE,
 		.pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -52,23 +59,26 @@ static void configure_external_system_outputs(void)
 
 static void set_brine_agitator_active(bool active)
 {
-	gpio_set_level(BRINE_AGITATOR_ENABLE_PIN, active ? 1 : 0);
-	gpio_set_level(BRINE_AGITATOR_SWITCH_PIN, active ? 1 : 0);
+	gpio_set_level(BRINE_AGITATOR_ENABLE_PIN, active ? 1 : 0); // logic active-high
 }
 
-static void set_patent_gear_active(bool active)
+static void set_salt_thrower_active(bool active)
 {
-	gpio_set_level(PATENT_GEAR_ENABLE_PIN, active ? 1 : 0);
-	gpio_set_level(PATENT_GEAR_SWITCH_PIN, active ? 1 : 0);
+	gpio_set_level(SALT_THROWER_ENABLE_PIN, active ? 1 : 0); // logic active-high
 }
 
-static void update_external_system_sequence(float current_rpm)
+static void set_sabertooth_relay_active(bool active)
 {
-	bool moving = current_rpm >= ROBOT_MOVING_RPM_THRESHOLD;
-	if (moving != patent_gear_active) {
-		patent_gear_active = moving;
-		set_patent_gear_active(patent_gear_active);
-		printf("[CTRL] Patent gear %s (RPM=%.1f)\n", patent_gear_active ? "ON" : "OFF", current_rpm);
+	gpio_set_level(SABERTOOTH_RELAY_PIN, active ? 1 : 0);
+}
+
+static void update_salt_thrower_from_salt_percent(float salt_percent)
+{
+	bool should_enable = salt_percent > 0.0f;
+	if (should_enable != salt_thrower_active) {
+		salt_thrower_active = should_enable;
+		set_salt_thrower_active(salt_thrower_active);
+		printf("[CTRL] Salt thrower %s (salt=%.1f%%)\n", salt_thrower_active ? "ON" : "OFF", salt_percent);
 	}
 }
 
@@ -118,12 +128,22 @@ static uint8_t volts_to_dac(float voltage)
 
 // Applies independent SALT/BRINE percentages by mapping each one to target
 // RPM/flow, then converting to analog DAC setpoints through calibration formulas.
-static void apply_percentages(float salt_percent, float brine_percent)
+static bool apply_percentages(float salt_percent, float brine_percent)
 {
+	if (!startup_check_completed) {
+		printf("[CTRL] Ignored SALT/BRINE command until STARTUP_CHECK completes\n");
+		send_stm32_line("STATUS:ERROR,STARTUP_REQUIRED\r\n");
+		return false;
+	}
+
 	float bounded_salt = clamp_percent(salt_percent);
 	float bounded_brine = clamp_percent(brine_percent);
-	float rpm = RPM_MIN + (bounded_salt / 100.0f) * (RPM_MAX - RPM_MIN);
-	float flow = FLOW_MIN + (bounded_brine / 100.0f) * (FLOW_MAX - FLOW_MIN);
+	float rpm = (bounded_salt == 0.0f)
+			? 0.0f
+			: (RPM_MIN + (bounded_salt / 100.0f) * (RPM_MAX - RPM_MIN));
+	float flow = (bounded_brine == 0.0f)
+			 ? 0.0f
+			 : (FLOW_MIN + (bounded_brine / 100.0f) * (FLOW_MAX - FLOW_MIN));
 
 	float next_v1 = rpm_to_v1(rpm);
 	float next_v2 = flow_to_v2(flow);
@@ -135,15 +155,20 @@ static void apply_percentages(float salt_percent, float brine_percent)
 	v2 = next_v2;
 	dac1_val = next_dac1;
 	dac2_val = next_dac2;
+	current_salt_percent = bounded_salt;
+	current_brine_percent = bounded_brine;
 	taskEXIT_CRITICAL(&pulse_mux);
+
+	update_salt_thrower_from_salt_percent(bounded_salt);
 
 	printf("Updated SALT %.1f%%, BRINE %.1f%% -> V1 = %.2f V, V2 = %.2f V\n",
 		   bounded_salt, bounded_brine, next_v1, next_v2);
+	return true;
 }
 
-static void apply_percentage(float percent)
+static bool apply_percentage(float percent)
 {
-	apply_percentages(percent, percent);
+	return apply_percentages(percent, percent);
 }
 
 static void send_stm32_line(const char *line)
@@ -154,11 +179,42 @@ static void send_stm32_line(const char *line)
 	(void)uart_write_bytes(STM32_UART_NUM, line, strlen(line));
 }
 
+static void start_startup_check(void)
+{
+	if (startup_check_running) {
+		printf("[CTRL] STARTUP_CHECK already running\n");
+		send_stm32_line("STATUS:OK,STARTUP_CHECK_RUNNING\r\n");
+		return;
+	}
+
+	startup_check_running = true;
+	startup_check_completed = false;
+	startup_check_started_tick = xTaskGetTickCount();
+	set_brine_agitator_active(true);
+
+	printf("[CTRL] STARTUP_CHECK accepted; agitating brine for %u ms\n", STARTUP_CHECK_DURATION_MS);
+	send_stm32_line("STATUS:OK,STARTUP_CHECK_STARTED\r\n");
+}
+
+static void bypass_startup_check(void)
+{
+	startup_check_running = false;
+	startup_check_completed = true;
+	set_brine_agitator_active(true);
+	printf("[CTRL] STARTUP_CHECK bypassed by STM command\n");
+	send_stm32_line("STATUS:OK,STARTUP_CHECK_BYPASSED\r\n");
+}
+
 // Accepts commands:[]
 // 1) PCT:<percent>
 // 2) SALT:<percent>,BRINE:<percent>
 // 3) TEST SALT <percent>
 // 4) TEST BRINE <percent>
+// 5) STARTUP_CHECK
+// 6) STARTUP_BYPASS
+// 7) s / S (shortcut for STARTUP_BYPASS)
+// 8) AGITATOR ON / AGITATOR OFF
+// 9) THROWER ON  / THROWER OFF
 static void process_stm32_command(const char *line)
 {
 	if (!line || line[0] == '\0') {
@@ -169,27 +225,90 @@ static void process_stm32_command(const char *line)
 	float salt = 0.0f;
 	float brine = 0.0f;
 
+	if (strcmp(line, "STARTUP_CHECK") == 0) {
+		start_startup_check();
+		return;
+	}
+
+	if (strcmp(line, "STARTUP_BYPASS") == 0) {
+		bypass_startup_check();
+		return;
+	}
+
+	if ((strcmp(line, "s") == 0) || (strcmp(line, "S") == 0)) {
+		bypass_startup_check();
+		return;
+	}
+
 	if (sscanf(line, "PCT:%f", &percent) == 1) {
-		apply_percentage(percent);
-		send_stm32_line("STATUS:OK\r\n");
+		if (apply_percentage(percent)) {
+			send_stm32_line("STATUS:OK\r\n");
+		}
 		return;
 	}
 
 	if (sscanf(line, "SALT:%f,BRINE:%f", &salt, &brine) == 2) {
-		apply_percentages(salt, brine);
-		send_stm32_line("STATUS:OK\r\n");
+		if (apply_percentages(salt, brine)) {
+			send_stm32_line("STATUS:OK\r\n");
+		}
 		return;
 	}
 
 	if (sscanf(line, "TEST SALT %f", &salt) == 1) {
-		apply_percentages(salt, 0.0f);
-		send_stm32_line("STATUS:OK\r\n");
+		if (apply_percentages(salt, 0.0f)) {
+			send_stm32_line("STATUS:OK\r\n");
+		}
 		return;
 	}
 
 	if (sscanf(line, "TEST BRINE %f", &brine) == 1) {
-		apply_percentages(0.0f, brine);
-		send_stm32_line("STATUS:OK\r\n");
+		if (apply_percentages(0.0f, brine)) {
+			send_stm32_line("STATUS:OK\r\n");
+		}
+		return;
+	}
+
+	if (strcmp(line, "AGITATOR ON") == 0) {
+		set_brine_agitator_active(true);
+		printf("[CTRL] Brine agitator forced ON via test command\n");
+		send_stm32_line("STATUS:OK,AGITATOR:ON\r\n");
+		return;
+	}
+
+	if (strcmp(line, "AGITATOR OFF") == 0) {
+		set_brine_agitator_active(false);
+		printf("[CTRL] Brine agitator forced OFF via test command\n");
+		send_stm32_line("STATUS:OK,AGITATOR:OFF\r\n");
+		return;
+	}
+
+	if (strcmp(line, "THROWER ON") == 0) {
+		salt_thrower_active = true;
+		set_salt_thrower_active(true);
+		printf("[CTRL] Salt thrower forced ON via test command\n");
+		send_stm32_line("STATUS:OK,THROWER:ON\r\n");
+		return;
+	}
+
+	if (strcmp(line, "THROWER OFF") == 0) {
+		salt_thrower_active = false;
+		set_salt_thrower_active(false);
+		printf("[CTRL] Salt thrower forced OFF via test command\n");
+		send_stm32_line("STATUS:OK,THROWER:OFF\r\n");
+		return;
+	}
+
+	if (strcmp(line, "RELAY ON") == 0) {
+		set_sabertooth_relay_active(true);
+		printf("[CTRL] Sabertooth relay forced ON via test command\n");
+		send_stm32_line("STATUS:OK,RELAY:ON\r\n");
+		return;
+	}
+
+	if (strcmp(line, "RELAY OFF") == 0) {
+		set_sabertooth_relay_active(false);
+		printf("[CTRL] Sabertooth relay forced OFF via test command\n");
+		send_stm32_line("STATUS:OK,RELAY:OFF\r\n");
 		return;
 	}
 
@@ -324,12 +443,16 @@ static void main_loop_task(void *arg)
 		uint8_t out_dac2;
 		float out_v1;
 		float out_v2;
+		float cmd_salt_percent;
+		float cmd_brine_percent;
 
 		portENTER_CRITICAL(&pulse_mux);
 		out_dac1 = dac1_val;
 		out_dac2 = dac2_val;
 		out_v1 = v1;
 		out_v2 = v2;
+		cmd_salt_percent = current_salt_percent;
+		cmd_brine_percent = current_brine_percent;
 		portEXIT_CRITICAL(&pulse_mux);
 
 		if (dac1_handle != NULL) {
@@ -339,14 +462,31 @@ static void main_loop_task(void *arg)
 			(void)dac_oneshot_output_voltage(dac2_handle, out_dac2);
 		}
 
+		if (startup_check_running) {
+			TickType_t now_ticks = xTaskGetTickCount();
+			uint32_t elapsed_ms = (uint32_t)((now_ticks - startup_check_started_tick) * portTICK_PERIOD_MS);
+			if (elapsed_ms >= STARTUP_CHECK_DURATION_MS) {
+				startup_check_running = false;
+				startup_check_completed = true;
+				printf("[CTRL] STARTUP_CHECK complete after %lu ms\n", (unsigned long)elapsed_ms);
+				send_stm32_line("STATUS:OK,STARTUP_CHECK_COMPLETE\r\n");
+			}
+		} else if (!startup_check_completed) {
+			TickType_t now_ticks = xTaskGetTickCount();
+			uint32_t gate_elapsed_ms = (uint32_t)((now_ticks - startup_gate_opened_tick) * portTICK_PERIOD_MS);
+			if (gate_elapsed_ms >= STARTUP_UNLOCK_TIMEOUT_MS) {
+				startup_check_completed = true;
+				printf("[CTRL] Startup gate timed out after %lu ms; enabling commands\n", (unsigned long)gate_elapsed_ms);
+				send_stm32_line("STATUS:OK,STARTUP_TIMEOUT_UNLOCK\r\n");
+			}
+		}
+
 		float fb_rpm;
 		float fb_flow_hz;
 		portENTER_CRITICAL(&feedback_mux);
 		fb_rpm = feedback.rpm;
 		fb_flow_hz = feedback.flow_hz;
 		portEXIT_CRITICAL(&feedback_mux);
-
-		update_external_system_sequence(fb_rpm);
 
 		float flow_lpm = (fb_flow_hz > 0.0f) ? (fb_flow_hz / FLOW_HZ_TO_LPM_DIVISOR) : 0.0f;
 		float flow_mlmin = flow_lpm * LPM_TO_MLMIN_FACTOR;
@@ -357,7 +497,9 @@ static void main_loop_task(void *arg)
 			   out_v1, out_v2, fb_flow_hz, flow_lpm, fb_rpm);
 
 		char flow_msg[STM32_TX_FLOW_MSG_BUFFER_LEN];
-		snprintf(flow_msg, sizeof(flow_msg), "FLOW:SALT:%u,BRINE:%u,RPM:%.1f\r\n", salt_mlmin, brine_mlmin, fb_rpm);
+		snprintf(flow_msg, sizeof(flow_msg),
+			 "FLOW:SALT:%u,BRINE:%u,RPM:%.1f,LPM:%.2f,HZ:%.1f,CMD_SALT:%.1f,CMD_BRINE:%.1f\r\n",
+			 salt_mlmin, brine_mlmin, fb_rpm, flow_lpm, fb_flow_hz, cmd_salt_percent, cmd_brine_percent);
 		send_stm32_line(flow_msg);
 
 		vTaskDelay(pdMS_TO_TICKS(MAIN_LOOP_PERIOD_MS));
@@ -415,11 +557,16 @@ void dispersion_controller_start(void)
 	gpio_isr_handler_add(FLOW_PIN, on_flow_pulse, NULL);
 
 	configure_external_system_outputs();
+	set_sabertooth_relay_active(true);
 	set_brine_agitator_active(true);
-	set_patent_gear_active(false);
-	printf("[CTRL] Brine agitator ON, patent gear waiting for movement\n");
+	set_salt_thrower_active(false);
+	printf("[CTRL] Brine agitator ON at boot; waiting for STM STARTUP_CHECK\n");
+ 
+	startup_gate_opened_tick = xTaskGetTickCount();
 
-	apply_percentage(0.0f);
+	startup_check_completed = true;
+	(void)apply_percentage(0.0f);
+	startup_check_completed = false;
 	send_stm32_line("STATUS:OK\r\n");
 
 	// Start runtime workers.
