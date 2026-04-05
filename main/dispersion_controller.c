@@ -84,6 +84,7 @@ static void update_salt_thrower_from_salt_percent(float salt_percent)
 	if (should_enable != salt_thrower_active) {
 		salt_thrower_active = should_enable;
 		set_salt_thrower_active(salt_thrower_active);
+		set_vibration_motor_active(salt_thrower_active);
 		printf("[CTRL] Salt thrower %s (salt=%.1f%%)\n", salt_thrower_active ? "ON" : "OFF", salt_percent);
 	}
 }
