@@ -20,6 +20,8 @@
 #define SALT_THROWER_ENABLE_PIN GPIO_NUM_12
 // Sabertooth power relay control
 #define SABERTOOTH_RELAY_PIN GPIO_NUM_14
+// Vibration motor switch output
+#define VIBRATION_MOTOR_ENABLE_PIN GPIO_NUM_27
 
 // UART link to STM32 (command + feedback channel)
 #define STM32_UART_NUM UART_NUM_1

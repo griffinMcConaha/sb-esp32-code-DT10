@@ -48,7 +48,8 @@ static void configure_external_system_outputs(void)
 	gpio_config_t output_cfg = {
 		.pin_bit_mask = (1ULL << BRINE_AGITATOR_ENABLE_PIN) |
 				(1ULL << SALT_THROWER_ENABLE_PIN) |
-				(1ULL << SABERTOOTH_RELAY_PIN),
+				(1ULL << SABERTOOTH_RELAY_PIN) |
+				(1ULL << VIBRATION_MOTOR_ENABLE_PIN),
 		.mode = GPIO_MODE_OUTPUT,
 		.pull_up_en = GPIO_PULLUP_DISABLE,
 		.pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -70,6 +71,11 @@ static void set_salt_thrower_active(bool active)
 static void set_sabertooth_relay_active(bool active)
 {
 	gpio_set_level(SABERTOOTH_RELAY_PIN, active ? 1 : 0);
+}
+
+static void set_vibration_motor_active(bool active)
+{
+	gpio_set_level(VIBRATION_MOTOR_ENABLE_PIN, active ? 1 : 0); // logic active-high
 }
 
 static void update_salt_thrower_from_salt_percent(float salt_percent)
@@ -215,6 +221,7 @@ static void bypass_startup_check(void)
 // 7) s / S (shortcut for STARTUP_BYPASS)
 // 8) AGITATOR ON / AGITATOR OFF
 // 9) THROWER ON  / THROWER OFF
+// 10) VIBRATION ON / VIBRATION OFF
 static void process_stm32_command(const char *line)
 {
 	if (!line || line[0] == '\0') {
@@ -309,6 +316,20 @@ static void process_stm32_command(const char *line)
 		set_sabertooth_relay_active(false);
 		printf("[CTRL] Sabertooth relay forced OFF via test command\n");
 		send_stm32_line("STATUS:OK,RELAY:OFF\r\n");
+		return;
+	}
+
+	if (strcmp(line, "VIBRATION ON") == 0) {
+		set_vibration_motor_active(true);
+		printf("[CTRL] Vibration motor forced ON via test command\n");
+		send_stm32_line("STATUS:OK,VIBRATION:ON\r\n");
+		return;
+	}
+
+	if (strcmp(line, "VIBRATION OFF") == 0) {
+		set_vibration_motor_active(false);
+		printf("[CTRL] Vibration motor forced OFF via test command\n");
+		send_stm32_line("STATUS:OK,VIBRATION:OFF\r\n");
 		return;
 	}
 
@@ -560,6 +581,7 @@ void dispersion_controller_start(void)
 	set_sabertooth_relay_active(true);
 	set_brine_agitator_active(true);
 	set_salt_thrower_active(false);
+	set_vibration_motor_active(false);
 	printf("[CTRL] Brine agitator ON at boot; waiting for STM STARTUP_CHECK\n");
  
 	startup_gate_opened_tick = xTaskGetTickCount();
