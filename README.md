@@ -22,6 +22,8 @@ This project runs on ESP32 and provides dispersion control + telemetry exchange 
 
 ## UART Protocol (ESP32 <-> STM32)
 
+Current UART link speed is 115200 baud (8N1).
+
 ### Incoming commands (STM32 -> ESP32)
 
 - `PCT:<percent>`

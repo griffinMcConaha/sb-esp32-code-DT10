@@ -207,7 +207,7 @@ static void bypass_startup_check(void)
 {
 	startup_check_running = false;
 	startup_check_completed = true;
-	set_brine_agitator_active(true);
+	set_brine_agitator_active(false);
 	printf("[CTRL] STARTUP_CHECK bypassed by STM command\n");
 	send_stm32_line("STATUS:OK,STARTUP_CHECK_BYPASSED\r\n");
 }
@@ -490,6 +490,7 @@ static void main_loop_task(void *arg)
 			if (elapsed_ms >= STARTUP_CHECK_DURATION_MS) {
 				startup_check_running = false;
 				startup_check_completed = true;
+				set_brine_agitator_active(false);
 				printf("[CTRL] STARTUP_CHECK complete after %lu ms\n", (unsigned long)elapsed_ms);
 				send_stm32_line("STATUS:OK,STARTUP_CHECK_COMPLETE\r\n");
 			}
@@ -498,6 +499,7 @@ static void main_loop_task(void *arg)
 			uint32_t gate_elapsed_ms = (uint32_t)((now_ticks - startup_gate_opened_tick) * portTICK_PERIOD_MS);
 			if (gate_elapsed_ms >= STARTUP_UNLOCK_TIMEOUT_MS) {
 				startup_check_completed = true;
+				set_brine_agitator_active(false);
 				printf("[CTRL] Startup gate timed out after %lu ms; enabling commands\n", (unsigned long)gate_elapsed_ms);
 				send_stm32_line("STATUS:OK,STARTUP_TIMEOUT_UNLOCK\r\n");
 			}
@@ -552,7 +554,7 @@ void dispersion_controller_start(void)
 		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
 		.source_clk = UART_SCLK_APB,
 	};
-	uart_driver_install(STM32_UART_NUM, 256, 0, 0, NULL, 0);
+	uart_driver_install(STM32_UART_NUM, STM32_UART_RX_BUF_SIZE, 0, STM32_UART_EVENT_QUEUE_LEN, NULL, 0);
 	uart_param_config(STM32_UART_NUM, &uart_cfg);
 	uart_set_pin(STM32_UART_NUM, STM32_UART_TX_PIN, STM32_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
@@ -593,10 +595,10 @@ void dispersion_controller_start(void)
 	send_stm32_line("STATUS:OK\r\n");
 
 	// Start runtime workers.
-	xTaskCreate(rpm_task, "rpm_task", 2048, NULL, 11, NULL);
-	xTaskCreate(flow_task, "flow_task", 2048, NULL, 11, NULL);
-	xTaskCreate(stm32_rx_task, "stm32_rx_task", 4096, NULL, 8, NULL);
-	xTaskCreate(main_loop_task, "main_loop_task", 4096, NULL, 9, NULL);
+	xTaskCreate(rpm_task, "rpm_task", RPM_TASK_STACK_SIZE, NULL, 11, NULL);
+	xTaskCreate(flow_task, "flow_task", FLOW_TASK_STACK_SIZE, NULL, 11, NULL);
+	xTaskCreate(stm32_rx_task, "stm32_rx_task", STM32_RX_TASK_STACK_SIZE, NULL, 8, NULL);
+	xTaskCreate(main_loop_task, "main_loop_task", MAIN_LOOP_TASK_STACK_SIZE, NULL, 9, NULL);
 
 	printf("[CTRL] Dispersion controller started\n");
 
