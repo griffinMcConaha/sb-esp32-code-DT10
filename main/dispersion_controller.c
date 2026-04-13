@@ -6,6 +6,7 @@
 #include "dispersion_controller.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 // Shared runtime state guarded by spinlocks for ISR/task safety.
@@ -24,6 +25,7 @@ static volatile uint8_t dac2_val = 0;
 
 static dac_oneshot_handle_t dac1_handle = NULL;
 static dac_oneshot_handle_t dac2_handle = NULL;
+static QueueHandle_t uart_event_queue = NULL;
 
 typedef struct {
 	float rpm;
@@ -419,37 +421,45 @@ static void flow_task(void *arg)
 	}
 }
 
-// Line-oriented UART parser for incoming STM32 commands.
+// Line-oriented UART parser for incoming STM32 commands using event queue.
 static void stm32_rx_task(void *arg)
 {
 	(void)arg;
 
 	char line[STM32_RX_LINE_BUFFER_LEN];
 	size_t index = 0;
-	uint8_t byte = 0;
+	uart_event_t event = {0};
+	uint8_t *dtmp = (uint8_t *)malloc(1024);
 
 	while (1) {
-		int got = uart_read_bytes(STM32_UART_NUM, &byte, 1, pdMS_TO_TICKS(STM32_RX_TIMEOUT_MS));
-		if (got <= 0) {
-			continue;
-		}
+		if (xQueueReceive(uart_event_queue, (void *)&event, portMAX_DELAY)) {
+			switch (event.type) {
+			case UART_DATA:
+				// Read available bytes
+				int len = uart_read_bytes(STM32_UART_NUM, dtmp, event.size, 0);
+				for (int i = 0; i < len; i++) {
+					uint8_t byte = dtmp[i];
 
-		if (byte == '\r' || byte == '\n') {
-			if (index > 0) {
-				line[index] = '\0';
-				process_stm32_command(line);
-				index = 0;
+					if (byte == '\r' || byte == '\n') {
+						if (index > 0) {
+							line[index] = '\0';
+							process_stm32_command(line);
+							index = 0;
+						}
+					} else if (index < (sizeof(line) - 1)) {
+						line[index++] = (char)byte;
+					} else {
+						index = 0;
+						send_stm32_line("STATUS:ERROR,OVERFLOW\r\n");
+					}
+				}
+				break;
+			default:
+				break;
 			}
-			continue;
-		}
-
-		if (index < (sizeof(line) - 1)) {
-			line[index++] = (char)byte;
-		} else {
-			index = 0;
-			send_stm32_line("STATUS:ERROR,OVERFLOW\r\n");
 		}
 	}
+	free(dtmp);
 }
 
 // Main control/telemetry loop:
@@ -554,7 +564,7 @@ void dispersion_controller_start(void)
 		.flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
 		.source_clk = UART_SCLK_APB,
 	};
-	uart_driver_install(STM32_UART_NUM, STM32_UART_RX_BUF_SIZE, 0, STM32_UART_EVENT_QUEUE_LEN, NULL, 0);
+	uart_driver_install(STM32_UART_NUM, STM32_UART_RX_BUF_SIZE, 0, STM32_UART_EVENT_QUEUE_LEN, &uart_event_queue, 0);
 	uart_param_config(STM32_UART_NUM, &uart_cfg);
 	uart_set_pin(STM32_UART_NUM, STM32_UART_TX_PIN, STM32_UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
