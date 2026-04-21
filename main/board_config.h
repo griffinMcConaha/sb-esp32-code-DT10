@@ -7,6 +7,10 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 
+// Centralized hardware/config constants for the ESP32 spreader controller.
+// Keeping these in one header makes it easier to retune the board for wiring
+// changes or recalibration without touching the runtime control logic.
+
 // Hardware pin mapping (ESP32 side)
 #define DAC1_CHANNEL DAC_CHAN_0
 #define DAC2_CHANNEL DAC_CHAN_1
@@ -32,7 +36,8 @@
 // Encoder pulses-per-revolution for RPM conversion
 #define PPR 600.0f
 
-// Output operating ranges used by apply_percentage(%)
+// Output operating ranges used by apply_percentage(%). These describe the
+// commanded mechanical range before it is converted into analog control volts.
 #define RPM_MIN 10.0f
 #define RPM_MAX 90.0f
 #define FLOW_MIN 700.0f
@@ -56,7 +61,8 @@
 #define LPM_TO_MLMIN_FACTOR (1000.0f / 60.0f)
 #define SALT_FROM_BRINE_DIVISOR 9U
 
-// Task and measurement timing
+// Task and measurement timing. These values shape the controller's balance
+// between responsiveness, measurement stability, and UART traffic volume.
 #define BOARD_STARTUP_DELAY_MS 200
 #define DAC_CHANNEL_INIT_DELAY_MS 50
 #define FLOW_MEASUREMENT_WINDOW_MS 1000

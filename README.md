@@ -22,7 +22,7 @@ This project runs on ESP32 and provides dispersion control + telemetry exchange 
 
 ## UART Protocol (ESP32 <-> STM32)
 
-Current UART link speed is 115200 baud (8N1).
+Current UART link speed is 230400 baud (8N1).
 
 ### Incoming commands (STM32 -> ESP32)
 
@@ -75,4 +75,5 @@ Tune these in `main/board_config.h`:
 
 - `app_main` is required by ESP-IDF and intentionally minimal.
 - Runtime logic is centralized in `dispersion_controller.c` for easier maintenance.
+- `board_config.h` is the canonical source for pin mapping, baud rate, timing, and calibration values when docs and code need to be reconciled.
 - If monitor output shows all zeros, verify sensor wiring and pulse generation on GPIO32/GPIO33.

@@ -9,6 +9,10 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
+// This module is the ESP32-side spreader controller. It translates high-level
+// SALT/BRINE commands from the STM32 into DAC outputs and GPIO enables, while
+// also measuring flow/RPM feedback and reporting that telemetry back upstream.
+
 // Shared runtime state guarded by spinlocks for ISR/task safety.
 static portMUX_TYPE pulse_mux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -45,6 +49,9 @@ static volatile TickType_t startup_gate_opened_tick = 0;
 
 static void send_stm32_line(const char *line);
 
+// The external drivers and actuators are deliberately split across dedicated
+// enable pins so the controller can independently gate agitator, thrower,
+// relay, and vibration hardware during startup/test sequences.
 static void configure_external_system_outputs(void)
 {
 	gpio_config_t output_cfg = {
@@ -140,6 +147,8 @@ static uint8_t volts_to_dac(float voltage)
 static bool apply_percentages(float salt_percent, float brine_percent)
 {
 	if (!startup_check_completed) {
+		// Refuse real dispensing commands until the startup gate is satisfied so
+		// the mechanical system has a chance to prime safely first.
 		printf("[CTRL] Ignored SALT/BRINE command until STARTUP_CHECK completes\n");
 		send_stm32_line("STATUS:ERROR,STARTUP_REQUIRED\r\n");
 		return false;
@@ -235,6 +244,8 @@ static void process_stm32_command(const char *line)
 	float salt = 0.0f;
 	float brine = 0.0f;
 
+	// Keep command parsing explicit and line-oriented because this path is used
+	// both by real upstream traffic and by manual bench-test commands.
 	if (strcmp(line, "STARTUP_CHECK") == 0) {
 		start_startup_check();
 		return;
@@ -435,6 +446,8 @@ static void stm32_rx_task(void *arg)
 		if (xQueueReceive(uart_event_queue, (void *)&event, portMAX_DELAY)) {
 			switch (event.type) {
 			case UART_DATA:
+				// Reassemble complete newline-delimited commands before handing
+				// them to the command parser so partial UART reads stay harmless.
 				// Read available bytes
 				int len = uart_read_bytes(STM32_UART_NUM, dtmp, event.size, 0);
 				for (int i = 0; i < len; i++) {
@@ -505,6 +518,9 @@ static void main_loop_task(void *arg)
 				send_stm32_line("STATUS:OK,STARTUP_CHECK_COMPLETE\r\n");
 			}
 		} else if (!startup_check_completed) {
+			// The timeout path is a safety valve for development and recovery: if
+			// the startup procedure is never explicitly completed, command gating
+			// eventually opens so the system does not stay permanently locked out.
 			TickType_t now_ticks = xTaskGetTickCount();
 			uint32_t gate_elapsed_ms = (uint32_t)((now_ticks - startup_gate_opened_tick) * portTICK_PERIOD_MS);
 			if (gate_elapsed_ms >= STARTUP_UNLOCK_TIMEOUT_MS) {
@@ -531,6 +547,8 @@ static void main_loop_task(void *arg)
 			   out_v1, out_v2, fb_flow_hz, flow_lpm, fb_rpm);
 
 		char flow_msg[STM32_TX_FLOW_MSG_BUFFER_LEN];
+		// Report both measured output and commanded percentages so the STM32 can
+		// compare intent versus observed spreader behavior in one frame.
 		snprintf(flow_msg, sizeof(flow_msg),
 			 "FLOW:SALT:%u,BRINE:%u,RPM:%.1f,LPM:%.2f,HZ:%.1f,CMD_SALT:%.1f,CMD_BRINE:%.1f\r\n",
 			 salt_mlmin, brine_mlmin, fb_rpm, flow_lpm, fb_flow_hz, cmd_salt_percent, cmd_brine_percent);
@@ -592,10 +610,10 @@ void dispersion_controller_start(void)
 
 	configure_external_system_outputs();
 	set_sabertooth_relay_active(true);
-	set_brine_agitator_active(true);
+	set_brine_agitator_active(false);
 	set_salt_thrower_active(false);
 	set_vibration_motor_active(false);
-	printf("[CTRL] Brine agitator ON at boot; waiting for STM STARTUP_CHECK\n");
+	printf("[CTRL] Brine agitator OFF at boot; waiting for explicit STM command\n");
  
 	startup_gate_opened_tick = xTaskGetTickCount();
 
